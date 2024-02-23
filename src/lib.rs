@@ -50,148 +50,41 @@ use bytes::{Bytes, BytesMut};
 use futures_core::{ready, Stream, TryStream};
 use futures_sink::Sink;
 use pin_project::pin_project;
+use rkyv::{ser::serializers::{AllocScratch, AllocScratchError, CompositeSerializer, CompositeSerializerError, FallbackScratch, HeapScratch, SharedSerializeMap, SharedSerializeMapError, WriteSerializer}, Archive, Archived};
 use std::{
     marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
 };
 
-/// Serializes a value into a destination buffer
-///
-/// Implementations of `Serializer` are able to take values of type `T` and
-/// convert them to a byte representation. The specific byte format, i.e. JSON,
-/// protobuf, binpack, ... is an implementation detail.
-///
-/// The `serialize` function takes `&mut self`, allowing for `Serializer`
-/// instances to be created with runtime configuration settings.
-///
-/// # Examples
-///
-/// An integer serializer that allows the width to be configured.
-///
-/// ```
-/// use tokio_serde::Serializer;
-/// use bytes::{Buf, Bytes, BytesMut, BufMut};
-/// use std::pin::Pin;
-///
-/// struct IntSerializer {
-///     width: usize,
-/// }
-///
-/// #[derive(Debug)]
-/// enum Error {
-///     Overflow,
-/// }
-///
-/// impl Serializer<u64> for IntSerializer {
-///     type Error = Error;
-///
-///     fn serialize(self: Pin<&mut Self>, item: &u64) -> Result<Bytes, Self::Error> {
-///         assert!(self.width <= 8);
-///
-///         let max = (1 << (self.width * 8)) - 1;
-///
-///         if *item > max {
-///             return Err(Error::Overflow);
-///         }
-///
-///         let mut ret = BytesMut::with_capacity(self.width);
-///         ret.put_uint(*item, self.width);
-///         Ok(ret.into())
-///     }
-/// }
-///
-/// let mut serializer = IntSerializer { width: 3 };
-///
-/// let buf = Pin::new(&mut serializer).serialize(&5).unwrap();
-/// assert_eq!(buf, &b"\x00\x00\x05"[..]);
-/// ```
-pub trait Serializer<T> {
-    type Error;
-
-    /// Serializes `item` into a new buffer
-    ///
-    /// The serialization format is specific to the various implementations of
-    /// `Serializer`. If the serialization is successful, a buffer containing
-    /// the serialized item is returned. If the serialization is unsuccessful,
-    /// an error is returned.
-    ///
-    /// Implementations of this function should not mutate `item` via any sort
-    /// of internal mutability strategy.
-    ///
-    /// See the trait level docs for more detail.
-    fn serialize(self: Pin<&mut Self>, item: &T) -> Result<Bytes, Self::Error>;
+type FramedSerializer<const N: usize> = CompositeSerializer<WriteSerializer<Vec<u8>>, FallbackScratch<HeapScratch<N>, AllocScratch>, SharedSerializeMap>;
+fn new<const N: usize>() -> FramedSerializer<N> {
+    CompositeSerializer::new(WriteSerializer::new(Vec::new()), FallbackScratch::new(HeapScratch::<N>::new(), AllocScratch::new()), SharedSerializeMap::new())
 }
 
-/// Deserializes a value from a source buffer
-///
-/// Implementatinos of `Deserializer` take a byte buffer and return a value by
-/// parsing the contents of the buffer according to the implementation's format.
-/// The specific byte format, i.e. JSON, protobuf, binpack, is an implementation
-/// detail
-///
-/// The `deserialize` function takes `&mut self`, allowing for `Deserializer`
-/// instances to be created with runtime configuration settings.
-///
-/// It is expected that the supplied buffer represents a full value and only
-/// that value. If after deserializing a value there are remaining bytes the
-/// buffer, the deserializer will return an error.
-///
-/// # Examples
-///
-/// An integer deserializer that allows the width to be configured.
-///
-/// ```
-/// use tokio_serde::Deserializer;
-/// use bytes::{BytesMut, Buf};
-/// use std::pin::Pin;
-///
-/// struct IntDeserializer {
-///     width: usize,
-/// }
-///
-/// #[derive(Debug)]
-/// enum Error {
-///     Underflow,
-///     Overflow
-/// }
-///
-/// impl Deserializer<u64> for IntDeserializer {
-///     type Error = Error;
-///
-///     fn deserialize(self: Pin<&mut Self>, buf: &BytesMut) -> Result<u64, Self::Error> {
-///         assert!(self.width <= 8);
-///
-///         if buf.len() > self.width {
-///             return Err(Error::Overflow);
-///         }
-///
-///         if buf.len() < self.width {
-///             return Err(Error::Underflow);
-///         }
-///
-///         let ret = std::io::Cursor::new(buf).get_uint(self.width);
-///         Ok(ret)
-///     }
-/// }
-///
-/// let mut deserializer = IntDeserializer { width: 3 };
-///
-/// let i = Pin::new(&mut deserializer).deserialize(&b"\x00\x00\x05"[..].into()).unwrap();
-/// assert_eq!(i, 5);
-/// ```
-pub trait Deserializer<T> {
-    type Error;
+type FramedError = CompositeSerializerError<std::io::Error, AllocScratchError, SharedSerializeMapError>;
 
-    /// Deserializes a value from `buf`
-    ///
-    /// The serialization format is specific to the various implementations of
-    /// `Deserializer`. If the deserialization is successful, the value is
-    /// returned. If the deserialization is unsuccessful, an error is returned.
-    ///
-    /// See the trait level docs for more detail.
-    fn deserialize(self: Pin<&mut Self>, src: &BytesMut) -> Result<T, Self::Error>;
+pub struct RkyvBytes<T> {
+    bytes: BytesMut,
+    _phantom: PhantomData<T>,
 }
+
+impl<T> RkyvBytes<T> {
+    pub fn new(bytes: BytesMut) -> Self {
+        Self {
+            bytes,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    pub fn archive(&self) -> &Archived<T>
+    where
+        T: Archive,
+    {
+        unsafe { rkyv::archived_root::<T>(&self.bytes) }
+    }
+}
+
 
 /// Adapts a transport to a value sink by serializing the values and to a stream of values by deserializing them.
 ///
@@ -212,20 +105,29 @@ pub trait Deserializer<T> {
 /// [tokio-util]: http://crates.io/crates/tokio-util
 #[pin_project]
 #[derive(Debug)]
-pub struct Framed<Transport, Item, SinkItem, Codec> {
+pub struct Framed<Transport, Item, SinkItem, const N: usize = 1024> {
     #[pin]
     inner: Transport,
-    #[pin]
-    codec: Codec,
     item: PhantomData<(Item, SinkItem)>,
 }
 
-impl<Transport, Item, SinkItem, Codec> Framed<Transport, Item, SinkItem, Codec> {
+impl<Transport, Item, SinkItem> Framed<Transport, Item, SinkItem> {
     /// Creates a new `Framed` with the given transport and codec.
-    pub fn new(inner: Transport, codec: Codec) -> Self {
+    pub fn new(inner: Transport) -> Self
+    where {
         Self {
             inner,
-            codec,
+            item: PhantomData,
+        }
+    }
+}
+
+impl<Transport, Item, SinkItem, const N: usize> Framed<Transport, Item, SinkItem, N> {
+    /// Creates a new `Framed` with the given transport and codec.
+    pub fn new_with_size(inner: Transport) -> Self
+    where {
+        Self {
+            inner,
             item: PhantomData,
         }
     }
@@ -256,32 +158,29 @@ impl<Transport, Item, SinkItem, Codec> Framed<Transport, Item, SinkItem, Codec> 
     }
 }
 
-impl<Transport, Item, SinkItem, Codec> Stream for Framed<Transport, Item, SinkItem, Codec>
+impl<Transport, Item, SinkItem, const N: usize> Stream for Framed<Transport, Item, SinkItem, N>
 where
     Transport: TryStream<Ok = BytesMut>,
-    Transport::Error: From<Codec::Error>,
     BytesMut: From<Transport::Ok>,
-    Codec: Deserializer<Item>,
+    Item: Archive,
 {
-    type Item = Result<Item, Transport::Error>;
+    type Item = Result<RkyvBytes<Item>, Transport::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match ready!(self.as_mut().project().inner.try_poll_next(cx)) {
-            Some(bytes) => Poll::Ready(Some(Ok(self
-                .as_mut()
-                .project()
-                .codec
-                .deserialize(&bytes?)?))),
+            Some(bytes) => {
+                let bytes = RkyvBytes::<Item>::new(bytes?);
+                Poll::Ready(Some(Ok(bytes)))
+            }
             None => Poll::Ready(None),
         }
     }
 }
 
-impl<Transport, Item, SinkItem, Codec> Sink<SinkItem> for Framed<Transport, Item, SinkItem, Codec>
+impl<Transport, Item, SinkItem, const N: usize> Sink<SinkItem> for Framed<Transport, Item, SinkItem, N>
 where
     Transport: Sink<Bytes>,
-    Codec: Serializer<SinkItem>,
-    Codec::Error: Into<Transport::Error>,
+    SinkItem: rkyv::Serialize<FramedSerializer<N>>,
 {
     type Error = Transport::Error;
 
@@ -290,8 +189,10 @@ where
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: SinkItem) -> Result<(), Self::Error> {
-        let res = self.as_mut().project().codec.serialize(&item);
-        let bytes = res.map_err(Into::into)?;
+        let mut ser = new::<N>();
+        item.serialize(&mut ser).unwrap();
+        let vec = ser.into_serializer().into_inner();
+        let bytes = Bytes::from(vec);
 
         self.as_mut().project().inner.start_send(bytes)?;
 
@@ -308,302 +209,10 @@ where
     }
 }
 
-pub type SymmetricallyFramed<Transport, Value, Codec> = Framed<Transport, Value, Value, Codec>;
+pub type SymmetricallyFramed<Transport, Value, const N: usize = 1024> = Framed<Transport, Value, Value, N>;
 
-#[cfg(any(
-    feature = "json",
-    feature = "bincode",
-    feature = "messagepack",
-    feature = "cbor"
-))]
-pub mod formats {
-    #[cfg(feature = "bincode")]
-    pub use self::bincode::*;
-    #[cfg(feature = "cbor")]
-    pub use self::cbor::*;
-    #[cfg(feature = "json")]
-    pub use self::json::*;
-    #[cfg(feature = "messagepack")]
-    pub use self::messagepack::*;
-
-    use super::{Deserializer, Serializer};
-    use bytes::{Bytes, BytesMut};
-    use educe::Educe;
-    use serde::{Deserialize, Serialize};
-    use std::{marker::PhantomData, pin::Pin};
-
-    #[cfg(feature = "bincode")]
-    mod bincode {
-        use super::*;
-        use bincode_crate::config::Options;
-        use std::io;
-
-        /// Bincode codec using [bincode](https://docs.rs/bincode) crate.
-        #[cfg_attr(docsrs, doc(cfg(feature = "bincode")))]
-        #[derive(Educe)]
-        #[educe(Debug)]
-        pub struct Bincode<Item, SinkItem, O = bincode_crate::DefaultOptions> {
-            #[educe(Debug(ignore))]
-            options: O,
-            #[educe(Debug(ignore))]
-            ghost: PhantomData<(Item, SinkItem)>,
-        }
-
-        impl<Item, SinkItem> Default for Bincode<Item, SinkItem> {
-            fn default() -> Self {
-                Bincode {
-                    options: Default::default(),
-                    ghost: PhantomData,
-                }
-            }
-        }
-
-        impl<Item, SinkItem, O> From<O> for Bincode<Item, SinkItem, O>
-        where
-            O: Options,
-        {
-            fn from(options: O) -> Self {
-                Self {
-                    options,
-                    ghost: PhantomData,
-                }
-            }
-        }
-
-        #[cfg_attr(docsrs, doc(cfg(feature = "bincode")))]
-        pub type SymmetricalBincode<T, O = bincode_crate::DefaultOptions> = Bincode<T, T, O>;
-
-        impl<Item, SinkItem, O> Deserializer<Item> for Bincode<Item, SinkItem, O>
-        where
-            for<'a> Item: Deserialize<'a>,
-            O: Options + Clone,
-        {
-            type Error = io::Error;
-
-            fn deserialize(self: Pin<&mut Self>, src: &BytesMut) -> Result<Item, Self::Error> {
-                self.options
-                    .clone()
-                    .deserialize(src)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-            }
-        }
-
-        impl<Item, SinkItem, O> Serializer<SinkItem> for Bincode<Item, SinkItem, O>
-        where
-            SinkItem: Serialize,
-            O: Options + Clone,
-        {
-            type Error = io::Error;
-
-            fn serialize(self: Pin<&mut Self>, item: &SinkItem) -> Result<Bytes, Self::Error> {
-                self.options
-                    .clone()
-                    .serialize(item)
-                    .map(From::from)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-            }
-        }
-    }
-
-    #[cfg(feature = "json")]
-    mod json {
-        use super::*;
-        use bytes::Buf;
-
-        /// JSON codec using [serde_json](https://docs.rs/serde_json) crate.
-        #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
-        #[derive(Educe)]
-        #[educe(Debug, Default)]
-        pub struct Json<Item, SinkItem> {
-            #[educe(Debug(ignore))]
-            ghost: PhantomData<(Item, SinkItem)>,
-        }
-
-        #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
-        pub type SymmetricalJson<T> = Json<T, T>;
-
-        impl<Item, SinkItem> Deserializer<Item> for Json<Item, SinkItem>
-        where
-            for<'a> Item: Deserialize<'a>,
-        {
-            type Error = serde_json::Error;
-
-            fn deserialize(self: Pin<&mut Self>, src: &BytesMut) -> Result<Item, Self::Error> {
-                serde_json::from_reader(std::io::Cursor::new(src).reader())
-            }
-        }
-
-        impl<Item, SinkItem> Serializer<SinkItem> for Json<Item, SinkItem>
-        where
-            SinkItem: Serialize,
-        {
-            type Error = serde_json::Error;
-
-            fn serialize(self: Pin<&mut Self>, item: &SinkItem) -> Result<Bytes, Self::Error> {
-                serde_json::to_vec(item).map(Into::into)
-            }
-        }
-    }
-
-    #[cfg(feature = "messagepack")]
-    mod messagepack {
-        use super::*;
-        use bytes::Buf;
-        use std::io;
-
-        /// MessagePack codec using [rmp-serde](https://docs.rs/rmp-serde) crate.
-        #[cfg_attr(docsrs, doc(cfg(feature = "messagepack")))]
-        #[derive(Educe)]
-        #[educe(Debug, Default)]
-        pub struct MessagePack<Item, SinkItem> {
-            #[educe(Debug(ignore))]
-            ghost: PhantomData<(Item, SinkItem)>,
-        }
-
-        #[cfg_attr(docsrs, doc(cfg(feature = "messagepack")))]
-        pub type SymmetricalMessagePack<T> = MessagePack<T, T>;
-
-        impl<Item, SinkItem> Deserializer<Item> for MessagePack<Item, SinkItem>
-        where
-            for<'a> Item: Deserialize<'a>,
-        {
-            type Error = io::Error;
-
-            fn deserialize(self: Pin<&mut Self>, src: &BytesMut) -> Result<Item, Self::Error> {
-                rmp_serde::from_read(std::io::Cursor::new(src).reader())
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-            }
-        }
-
-        impl<Item, SinkItem> Serializer<SinkItem> for MessagePack<Item, SinkItem>
-        where
-            SinkItem: Serialize,
-        {
-            type Error = io::Error;
-
-            fn serialize(self: Pin<&mut Self>, item: &SinkItem) -> Result<Bytes, Self::Error> {
-                Ok(rmp_serde::to_vec(item)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-                    .into())
-            }
-        }
-    }
-
-    #[cfg(feature = "cbor")]
-    mod cbor {
-        use super::*;
-        use std::io;
-
-        /// CBOR codec using [serde_cbor](https://docs.rs/serde_cbor) crate.
-        #[cfg_attr(docsrs, doc(cfg(feature = "cbor")))]
-        #[derive(Educe)]
-        #[educe(Debug, Default)]
-        pub struct Cbor<Item, SinkItem> {
-            #[educe(Debug(ignore))]
-            _mkr: PhantomData<(Item, SinkItem)>,
-        }
-
-        #[cfg_attr(docsrs, doc(cfg(feature = "cbor")))]
-        pub type SymmetricalCbor<T> = Cbor<T, T>;
-
-        impl<Item, SinkItem> Deserializer<Item> for Cbor<Item, SinkItem>
-        where
-            for<'a> Item: Deserialize<'a>,
-        {
-            type Error = io::Error;
-
-            fn deserialize(self: Pin<&mut Self>, src: &BytesMut) -> Result<Item, Self::Error> {
-                serde_cbor::from_slice(src.as_ref()).map_err(into_io_error)
-            }
-        }
-
-        impl<Item, SinkItem> Serializer<SinkItem> for Cbor<Item, SinkItem>
-        where
-            SinkItem: Serialize,
-        {
-            type Error = io::Error;
-
-            fn serialize(self: Pin<&mut Self>, item: &SinkItem) -> Result<Bytes, Self::Error> {
-                serde_cbor::to_vec(item)
-                    .map_err(into_io_error)
-                    .map(Into::into)
-            }
-        }
-
-        fn into_io_error(cbor_err: serde_cbor::Error) -> io::Error {
-            use io::ErrorKind;
-            use serde_cbor::error::Category;
-            use std::error::Error;
-
-            match cbor_err.classify() {
-                Category::Eof => io::Error::new(ErrorKind::UnexpectedEof, cbor_err),
-                Category::Syntax => io::Error::new(ErrorKind::InvalidInput, cbor_err),
-                Category::Data => io::Error::new(ErrorKind::InvalidData, cbor_err),
-                Category::Io => {
-                    // Extract the underlying io error's type
-                    let kind = cbor_err
-                        .source()
-                        .and_then(|err| err.downcast_ref::<io::Error>())
-                        .map(|io_err| io_err.kind())
-                        .unwrap_or(ErrorKind::Other);
-                    io::Error::new(kind, cbor_err)
-                }
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "bincode")]
-    #[test]
-    fn bincode_impls() {
-        use impls::impls;
-        use std::fmt::Debug;
-
-        struct Nothing;
-        type T = crate::formats::Bincode<Nothing, Nothing>;
-
-        assert!(impls!(T: Debug));
-        assert!(impls!(T: Default));
-    }
-
-    #[cfg(feature = "json")]
-    #[test]
-    fn json_impls() {
-        use impls::impls;
-        use std::fmt::Debug;
-
-        struct Nothing;
-        type T = crate::formats::Json<Nothing, Nothing>;
-
-        assert!(impls!(T: Debug));
-        assert!(impls!(T: Default));
-    }
-
-    #[cfg(feature = "messagepack")]
-    #[test]
-    fn messagepack_impls() {
-        use impls::impls;
-        use std::fmt::Debug;
-
-        struct Nothing;
-        type T = crate::formats::MessagePack<Nothing, Nothing>;
-
-        assert!(impls!(T: Debug));
-        assert!(impls!(T: Default));
-    }
-
-    #[cfg(feature = "cbor")]
-    #[test]
-    fn cbor_impls() {
-        use impls::impls;
-        use std::fmt::Debug;
-
-        struct Nothing;
-        type T = crate::formats::Cbor<Nothing, Nothing>;
-
-        assert!(impls!(T: Debug));
-        assert!(impls!(T: Default));
-    }
+    
 }

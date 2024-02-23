@@ -1,8 +1,11 @@
 use futures::prelude::*;
-use serde_json::json;
 use tokio::net::TcpStream;
-use tokio_serde::formats::*;
 use tokio_util::codec::{FramedWrite, LengthDelimitedCodec};
+
+#[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct Hello {
+    name: String,
+}
 
 #[tokio::main]
 pub async fn main() {
@@ -14,18 +17,13 @@ pub async fn main() {
 
     // Serialize frames with JSON
     let mut serialized =
-        tokio_serde::SymmetricallyFramed::new(length_delimited, SymmetricalJson::default());
+        tokio_rkyv::SymmetricallyFramed::new(length_delimited);
 
     // Send the value
     serialized
-        .send(json!({
-            "name": "John Doe",
-            "age": 43,
-            "phones": [
-                "+44 1234567",
-                "+44 2345678"
-            ]
-        }))
+        .send(Hello {
+            name: "world".to_string(),
+        })
         .await
         .unwrap()
 }
