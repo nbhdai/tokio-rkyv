@@ -3,22 +3,22 @@ name = "tokio-rkyv"
 version = "0.9.0"
 edition = "2021"
 authors = [
-    "Sven Cattell <me@carllerche.com>",
+    "Sven Cattell <scattell@gmail.com>",
 ]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 categories = ["asynchronous", "encoding"]
-keywords = ["async", "serde", "serialization"]
-repository = "https://github.com/carllerche/tokio-serde"
-homepage = "https://github.com/carllerche/tokio-serde"
-documentation = "https://docs.rs/tokio-serde"
+keywords = ["async", "rkyv", "serialization"]
+repository = "https://github.com/nbhd/tokio-rkyv"
+homepage = "https://github.com/nbhd/tokio-rkyv"
+documentation = "https://docs.rs/tokio-rkyv"
 description = """
 Send and receive rkyv encodable types over the network using Tokio.
 
 This library is used as a building block for serialization format specific
 libraries.
 
-Forked from tokio-serde. 
+Forked from tokio-serde, and tokio-utils codec
 """
 
 [dependencies]
@@ -27,12 +27,13 @@ futures-core = "0.3"
 futures-sink = "0.3"
 pin-project = "1"
 rkyv = { version = "0.7.44", features = ["validation", "bytecheck"] }
+tokio = { version = "1.28.0", features = ["sync"] }
+tracing = { version = "0.1.25", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 futures = "0.3"
 impls = "1"
 tokio = { version = "1.0", features = ["full"] }
-tokio-util = { version = "0.7", features = ["codec"] }
 static_assertions = "1.1.0"
 
 [package.metadata.docs.rs]

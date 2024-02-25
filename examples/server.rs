@@ -1,6 +1,6 @@
 use futures::prelude::*;
 use tokio::net::TcpListener;
-use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
+use tokio_rkyv::RkyvStream;
 
 #[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 #[archive_attr(derive(Debug))]
@@ -19,12 +19,7 @@ pub async fn main() {
         let (socket, _) = listener.accept().await.unwrap();
 
         // Delimit frames using a length header
-        let length_delimited = FramedRead::new(socket, LengthDelimitedCodec::new());
-
-        // Deserialize frames
-        let mut deserialized = tokio_rkyv::SymmetricallyFramed::<_,Hello>::new(
-            length_delimited,
-        );
+        let mut deserialized = RkyvStream::<_, Hello>::new(socket);
 
         // Spawn a task that prints all received messages to STDOUT
         tokio::spawn(async move {
