@@ -1,7 +1,12 @@
+use futures_sink::Sink;
+
 use futures_core::Stream;
+use rkyv::ser::Serializer;
 use rkyv::AlignedVec;
 use rkyv::Archive;
 use rkyv::Archived;
+use rkyv::Fallible;
+use tokio::io::AsyncWrite;
 use tokio::io::{AsyncRead, ReadBuf};
 
 use futures_core::ready;
@@ -10,6 +15,8 @@ use std::borrow::Borrow;
 use std::borrow::BorrowMut;
 use std::fmt;
 use std::io;
+use std::io::IoSlice;
+use std::io::Write;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tracing::trace;
@@ -33,7 +40,6 @@ impl<T> RkyvVec<T> {
     {
         unsafe { rkyv::archived_root::<T>(&self.bytes) }
     }
-    
 }
 
 enum DecoderState {
@@ -41,7 +47,7 @@ enum DecoderState {
     Body(usize),
 }
 
-struct RkyvDecoder {
+pub struct RkyvDecoder {
     buffer: AlignedVec,
     eof: bool,
     is_readable: bool,
@@ -88,14 +94,14 @@ impl RkyvDecoder {
             self.decoder_state = DecoderState::Header;
             return Ok(16 - self.buffer.len());
         }
-    
+
         let mut len_bytes = [0; 8];
         len_bytes.copy_from_slice(&self.buffer[0..8]);
         let n = u64::from_le_bytes(len_bytes) as usize;
         self.decoder_state = DecoderState::Body(n);
 
         match self.buffer.len().cmp(&n) {
-            std::cmp::Ordering::Less => Ok(n-self.buffer.len()),
+            std::cmp::Ordering::Less => Ok(n - self.buffer.len()),
             std::cmp::Ordering::Equal => Ok(0),
             std::cmp::Ordering::Greater => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -104,15 +110,17 @@ impl RkyvDecoder {
         }
     }
 
-    fn read<T: AsyncRead>(&mut self, io: Pin<&mut T>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
+    fn read<T: AsyncRead>(
+        &mut self,
+        io: Pin<&mut T>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<usize>> {
         match self.decoder_state {
             DecoderState::Header => {
                 self.buffer.resize(1024, 0);
-                
             }
             DecoderState::Body(n) => {
-                self.buffer.resize(n+1, 0);
-
+                self.buffer.resize(n + 1, 0);
             }
         }
         let mut buf = ReadBuf::new(&mut self.buffer[self.written_bytes..]);
@@ -122,9 +130,12 @@ impl RkyvDecoder {
         Poll::Ready(Ok(self.written_bytes))
     }
 
-    /// mem swaps the buffer and 
+    /// mem swaps the buffer and
     fn buffer<T>(&mut self) -> RkyvVec<T> {
-        let bytes = std::mem::replace(&mut self.buffer, AlignedVec::with_capacity(self.written_bytes));
+        let bytes = std::mem::replace(
+            &mut self.buffer,
+            AlignedVec::with_capacity(self.written_bytes),
+        );
         self.written_bytes = 0;
         RkyvVec {
             bytes,
@@ -133,7 +144,101 @@ impl RkyvDecoder {
     }
 }
 
-struct RWFrames {
+const INITIAL_CAPACITY: usize = 8 * 1024;
+
+#[derive(Debug)]
+pub struct RkyvLengthEncoder {
+    buffer: AlignedVec,
+    written: usize,
+    backpressure_boundary: usize,
+}
+
+impl Fallible for RkyvLengthEncoder {
+    type Error = io::Error;
+}
+
+impl Serializer for RkyvLengthEncoder {
+    /// Returns the current position of the serializer.
+    fn pos(&self) -> usize {
+        0
+    }
+
+    /// Attempts to write the given bytes to the serializer.
+    fn write(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.buffer.write(bytes)?;
+        Ok(())
+    }
+}
+
+impl RkyvLengthEncoder {
+    pub fn new() -> Self {
+        Self {
+            buffer: AlignedVec::with_capacity(INITIAL_CAPACITY),
+            written: 0,
+            backpressure_boundary: INITIAL_CAPACITY,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    pub fn has_remaining(&self) -> bool {
+        self.written < self.buffer.len()
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.buffer[self.written..]
+    }
+
+    pub fn advance(&mut self, n: usize) {
+        self.written += n;
+    }
+
+    pub fn encode<'a, T: rkyv::Serialize<Self>>(&mut self, data: T) -> Result<(), io::Error> {
+        // Clear and write the header to the data.
+        self.buffer.clear();
+        self.buffer.extend_from_slice(&[0; 16]);
+        self.written = 0;
+        // Serialize the data to the buffer.
+        data.serialize(self).unwrap();
+        // Update the header with the total written
+        let len_bytes = (self.buffer.len() as u64).to_ne_bytes();
+        self.buffer[0..8].copy_from_slice(&len_bytes);
+
+        Ok(())
+    }
+
+    fn write_to<T: AsyncWrite>(
+        &mut self,
+        io: Pin<&mut T>,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<usize>> {
+        const MAX_BUFS: usize = 64;
+
+        if !self.has_remaining() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let n = if io.is_write_vectored() {
+            let slices = [IoSlice::new(self.data()); MAX_BUFS];
+
+            ready!(io.poll_write_vectored(cx, &slices))?
+        } else {
+            ready!(io.poll_write(cx, self.data()))?
+        };
+
+        self.advance(n);
+
+        Poll::Ready(Ok(n))
+    }
+}
+
+pub struct RWFrames {
     read: RkyvDecoder,
     write: RkyvLengthEncoder,
 }
@@ -160,12 +265,16 @@ impl BorrowMut<RkyvLengthEncoder> for RWFrames {
 }
 
 #[pin_project]
-pub struct RkyvStream<T, I> {
+pub struct Framed<T, I, State> {
     #[pin]
     inner: T,
-    state: RkyvDecoder,
+    state: State,
     data: std::marker::PhantomData<I>,
 }
+
+pub type RkyvStream<T, I> = Framed<T, I, RkyvDecoder>;
+pub type RkyvSink<T, I> = Framed<T, I, RkyvLengthEncoder>;
+pub type RkyvTransport<T, I> = Framed<T, I, RWFrames>;
 
 impl<T, I> RkyvStream<T, I> {
     pub fn new(inner: T) -> Self {
@@ -177,15 +286,38 @@ impl<T, I> RkyvStream<T, I> {
     }
 }
 
-impl<T, I> Stream for RkyvStream<T, I>
+impl<T, I> RkyvSink<T, I> {
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            state: RkyvLengthEncoder::new(),
+            data: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T, I> RkyvTransport<T, I> {
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            state: RWFrames {
+                read: RkyvDecoder::new(),
+                write: RkyvLengthEncoder::new(),
+            },
+            data: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T, I, D> Stream for Framed<T, I, D>
 where
     T: AsyncRead,
     I: rkyv::Archive,
+    D: BorrowMut<RkyvDecoder>,
 {
     type Item = Result<RkyvVec<I>, io::Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-
         let mut pinned = self.project();
         let state: &mut RkyvDecoder = pinned.state.borrow_mut();
         // The following loops implements a state machine with each state corresponding
@@ -248,20 +380,18 @@ where
                 state.is_readable = false;
                 return Poll::Ready(Some(Ok(state.buffer())));
             }
-            
+
             // reading or paused
             // If we can't build a frame yet, try to read more data and try again.
             // Make sure we've got room for at least one byte to read to ensure
             // that we don't get a spurious 0 that looks like EOF.
-        
+
             #[allow(clippy::blocks_in_conditions)]
-            let bytect = match state.read(pinned.inner.as_mut(), cx).map_err(
-                |err| {
-                    trace!("Got an error, going to errored state");
-                    state.has_errored = true;
-                    err
-                },
-            )? {
+            let bytect = match state.read(pinned.inner.as_mut(), cx).map_err(|err| {
+                trace!("Got an error, going to errored state");
+                state.has_errored = true;
+                err
+            })? {
                 Poll::Ready(ct) => ct,
                 // implicit reading -> reading or implicit paused -> paused
                 Poll::Pending => return Poll::Pending,
@@ -284,5 +414,65 @@ where
             // paused -> framing or reading -> framing or reading -> pausing
             state.is_readable = true;
         }
+    }
+}
+
+impl<T, I, E> Sink<I> for Framed<T, I, E>
+where
+    T: AsyncWrite,
+    I: rkyv::Serialize<RkyvLengthEncoder>,
+    E: BorrowMut<RkyvLengthEncoder>,
+{
+    type Error = io::Error;
+
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if self.state.borrow().len() >= self.state.borrow().backpressure_boundary {
+            Sink::<I>::poll_flush(self.as_mut(), cx)
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: I) -> Result<(), Self::Error> {
+        let pinned = self.project();
+        pinned.state.borrow_mut().encode(item)?;
+        Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        trace!("flushing framed transport");
+        let mut pinned = self.project();
+
+        while !pinned.state.borrow_mut().is_empty() {
+            let buffer = pinned.state.borrow_mut();
+            trace!(remaining = buffer.len(), "writing;");
+
+            let n = ready!(pinned
+                .state
+                .borrow_mut()
+                .write_to(pinned.inner.as_mut(), cx))?;
+
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to \
+                     write frame to transport",
+                )
+                .into()));
+            }
+        }
+
+        // Try flushing the underlying IO
+        ready!(pinned.inner.poll_flush(cx))?;
+
+        trace!("framed transport flushed");
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        ready!(Sink::<I>::poll_flush(self.as_mut(), cx))?;
+        ready!(self.project().inner.poll_shutdown(cx))?;
+
+        Poll::Ready(Ok(()))
     }
 }

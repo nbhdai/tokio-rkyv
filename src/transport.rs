@@ -50,17 +50,33 @@ use bytes::{Bytes, BytesMut};
 use futures_core::{ready, Stream, TryStream};
 use futures_sink::Sink;
 use pin_project::pin_project;
-use rkyv::{ser::serializers::{AllocScratch, AllocScratchError, CompositeSerializer, CompositeSerializerError, FallbackScratch, HeapScratch, SharedSerializeMap, SharedSerializeMapError, WriteSerializer}, validation::validators::DefaultValidator, Archive, Archived, CheckBytes, Deserialize, Fallible, Infallible};
+use rkyv::{
+    ser::serializers::{
+        AllocScratch, CompositeSerializer, FallbackScratch, HeapScratch, SharedSerializeMap,
+        WriteSerializer,
+    },
+    Archive, Archived,
+};
 use std::{
-    marker::PhantomData, pin::Pin, task::{Context, Poll}
+    marker::PhantomData,
+    pin::Pin,
+    task::{Context, Poll},
 };
 
-type FramedSerializer<const N: usize> = CompositeSerializer<WriteSerializer<Vec<u8>>, FallbackScratch<HeapScratch<N>, AllocScratch>, SharedSerializeMap>;
-fn new<const N: usize>() -> FramedSerializer<N> {
-    CompositeSerializer::new(WriteSerializer::new(Vec::new()), FallbackScratch::new(HeapScratch::<N>::new(), AllocScratch::new()), SharedSerializeMap::new())
-}
+use crate::unpacker::{CheckedDeserUnpacker, CheckedZeroCopyUnpacker, DeserUnpacker, Unpacker, ZeroCopyUnpacker};
 
-type FramedError = CompositeSerializerError<std::io::Error, AllocScratchError, SharedSerializeMapError>;
+type FramedSerializer<const N: usize> = CompositeSerializer<
+    WriteSerializer<Vec<u8>>,
+    FallbackScratch<HeapScratch<N>, AllocScratch>,
+    SharedSerializeMap,
+>;
+fn new<const N: usize>() -> FramedSerializer<N> {
+    CompositeSerializer::new(
+        WriteSerializer::new(Vec::new()),
+        FallbackScratch::new(HeapScratch::<N>::new(), AllocScratch::new()),
+        SharedSerializeMap::new(),
+    )
+}
 
 pub struct RkyvBytes<T> {
     bytes: BytesMut,
@@ -82,7 +98,6 @@ impl<T> RkyvBytes<T> {
         unsafe { rkyv::archived_root::<T>(&self.bytes) }
     }
 }
-
 
 /// Adapts a transport to a value sink by serializing the values and to a stream of values by deserializing them.
 ///
@@ -106,109 +121,34 @@ impl<T> RkyvBytes<T> {
 pub struct Framed<Transport, Item, SinkItem, UP, const N: usize = 1024> {
     #[pin]
     inner: Transport,
-    packer: UP,
-    item: PhantomData<(Item, SinkItem)>,
+    item: PhantomData<(Item, SinkItem, UP)>,
 }
 
-pub trait Unpacker {
-    type Item;
-    fn unpack(bytes: BytesMut) -> Result<Self::Item, std::io::Error>;
-}
-
-pub struct ZeroCopyUnpacker<I> {
-    item: PhantomData<I>
-}
-
-impl<I> Unpacker for ZeroCopyUnpacker<I> {
-    type Item = RkyvBytes<I>;
-    fn unpack(bytes: BytesMut) -> Result<Self::Item, std::io::Error> {
-        Ok(RkyvBytes::<I>::new(bytes))
-    }
-}
-
-pub struct DeserUnpacker<I> {
-    item: PhantomData<I>
-}
-
-impl<I: Archive> Unpacker for DeserUnpacker<I>
-    where I: Archive,
-    Archived<I>: Deserialize<I, Infallible>
-{
-    type Item = I;
-    fn unpack(bytes: BytesMut) -> Result<Self::Item, std::io::Error> {
-        let archived = unsafe { rkyv::archived_root::<I>(&bytes) };
-        let item: I = archived.deserialize(&mut Infallible).unwrap();
-        Ok(item)
-    }
-}
-
-pub struct CheckedZeroCopyUnpacker<I> {
-    item: PhantomData<I>
-}
-
-impl<'a, I> Unpacker for CheckedZeroCopyUnpacker<I>
-    where I: Archive,
-    Archived<I>: CheckBytes<DefaultValidator<'a>> + 'a,
-{
-    type Item = RkyvBytes<I>;
-    fn unpack(bytes: BytesMut) -> Result<Self::Item, std::io::Error> {
-        let bbytes = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
-        let _archived = rkyv::check_archived_root::<I>(bbytes).map_err(|e| {
-            tracing::error!("Invalid rkyv archive: {}", e);
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid rkyv archive")
-        })?;
-
-        Ok(RkyvBytes::<I>::new(bytes))
-    }
-}
-
-pub struct CheckedDeserUnpacker<I> {
-    item: PhantomData<I>
-}
-
-impl<'a, I> Unpacker for CheckedDeserUnpacker<I>
-    where I: Archive,
-    Archived<I>: Deserialize<I, Infallible> + CheckBytes<DefaultValidator<'a>> + 'a,
-{
-    type Item = I;
-    fn unpack(bytes: BytesMut) -> Result<Self::Item, std::io::Error> {
-        // relifetime this borrow to the lifetime of the bytes, safe as we drop the archive before the bytes
-        let bbytes = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
-        let archived = rkyv::check_archived_root::<I>(bbytes).map_err(|e| {
-            tracing::error!("Invalid rkyv archive: {}", e);
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid rkyv archive")
-        })?;
-        let item: I = archived.deserialize(&mut Infallible).unwrap();
-        Ok(item)
-    }
-}
-
-impl<Transport, Item, SinkItem> Framed<Transport, Item, SinkItem, ZeroCopyUnpacker<Item>> {
+impl<Transport, Item, SinkItem, UP> Framed<Transport, Item, SinkItem, UP> {
     /// Creates a new `Framed` with the given transport and codec.
     pub fn new(inner: Transport) -> Self
-    where {
+where {
         Self {
             inner,
-            packer: ZeroCopyUnpacker {item : PhantomData},
             item: PhantomData,
         }
     }
 }
 
-impl<Transport, Item, SinkItem, const N: usize> Framed<Transport, Item, SinkItem, ZeroCopyUnpacker<Item>, N> {
+impl<Transport, Item, SinkItem, UP, const N: usize>
+    Framed<Transport, Item, SinkItem, UP, N>
+{
     /// Creates a new `Framed` with the given transport and codec.
     pub fn new_with_size(inner: Transport) -> Self
-    where {
+where {
         Self {
             inner,
-            packer: ZeroCopyUnpacker {item : PhantomData},
             item: PhantomData,
         }
     }
 }
 
 impl<Transport, Item, SinkItem, UP, const N: usize> Framed<Transport, Item, SinkItem, UP, N> {
-
     /// Returns a reference to the underlying transport wrapped by `Framed`.
     ///
     /// Note that care should be taken to not tamper with the underlying transport as
@@ -235,12 +175,13 @@ impl<Transport, Item, SinkItem, UP, const N: usize> Framed<Transport, Item, Sink
     }
 }
 
-impl<Transport, Item, SinkItem, UP, const N: usize> Stream for Framed<Transport, Item, SinkItem, UP, N>
+impl<Transport, Item, SinkItem, UP, const N: usize> Stream
+    for Framed<Transport, Item, SinkItem, UP, N>
 where
     Transport: TryStream<Ok = BytesMut>,
     BytesMut: From<Transport::Ok>,
     Item: Archive,
-    UP: Unpacker<Item = Item>,
+    UP: Unpacker<Item = Item, Input = BytesMut>,
     Transport::Error: From<std::io::Error>,
 {
     type Item = Result<UP::Item, Transport::Error>;
@@ -257,7 +198,8 @@ where
     }
 }
 
-impl<Transport, Item, SinkItem, UP, const N: usize> Sink<SinkItem> for Framed<Transport, Item, SinkItem, UP, N>
+impl<Transport, Item, SinkItem, UP, const N: usize> Sink<SinkItem>
+    for Framed<Transport, Item, SinkItem, UP, N>
 where
     Transport: Sink<Bytes>,
     SinkItem: rkyv::Serialize<FramedSerializer<N>>,
@@ -289,13 +231,16 @@ where
     }
 }
 
-pub type SymmetricallyFramed<Transport, Value, UP, const N: usize = 1024> = Framed<Transport, Value, Value, UP, N>;
-pub type ZeroCopyFramed<Transport, Value, const N: usize = 1024> = Framed<Transport, Value, Value, ZeroCopyUnpacker<Value>, N>;
-pub type DeserFramed<Transport, Value, const N: usize = 1024> = Framed<Transport, Value, Value, DeserUnpacker<Value>, N>;
-pub type CheckedZeroCopyFramed<Transport, Value, const N: usize = 1024> = Framed<Transport, Value, Value, CheckedZeroCopyUnpacker<Value>, N>;
-pub type CheckedDeserFramed<Transport, Value, const N: usize = 1024> = Framed<Transport, Value, Value, CheckedDeserUnpacker<Value>, N>;
+pub type SymmetricallyFramed<Transport, Value, UP, const N: usize = 1024> =
+    Framed<Transport, Value, Value, UP, N>;
+pub type ZeroCopyFramed<Transport, Value, const N: usize = 1024> =
+    Framed<Transport, Value, Value, ZeroCopyUnpacker<Value>, N>;
+pub type DeserFramed<Transport, Value, const N: usize = 1024> =
+    Framed<Transport, Value, Value, DeserUnpacker<Value>, N>;
+pub type CheckedZeroCopyFramed<Transport, Value, const N: usize = 1024> =
+    Framed<Transport, Value, Value, CheckedZeroCopyUnpacker<Value>, N>;
+pub type CheckedDeserFramed<Transport, Value, const N: usize = 1024> =
+    Framed<Transport, Value, Value, CheckedDeserUnpacker<Value>, N>;
 
 #[cfg(test)]
-mod tests {
-    
-}
+mod tests {}

@@ -15,7 +15,6 @@ pub async fn main() {
     // Delimit frames using a length header
     let mut serialized = RkyvSink::new(socket);
 
-
     // Send the value
     serialized
         .send(Hello {
